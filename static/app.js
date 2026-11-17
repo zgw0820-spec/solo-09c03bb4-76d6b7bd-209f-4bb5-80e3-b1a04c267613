@@ -33,6 +33,8 @@ const el = (tag, cls, text) => {
 const fmt = (n, d = 3) =>
   n === null || n === undefined || Number.isNaN(n) ? "—" : Number(n).toFixed(d);
 const esc = (s) => (s === null || s === undefined ? "" : String(s));
+// Show only the wall-clock portion of an ISO timestamp, down to milliseconds.
+const clockOf = (iso) => (iso ? String(iso).slice(11, 23) : "—");
 
 let toastTimer = null;
 function toast(message, isError = false) {
@@ -74,7 +76,8 @@ function statusPill(status) {
     timeout: ["timeout", "超时"],
     error: ["error", "错误"],
     accepted: ["pending", "已接单"],
-    queued: ["pending", "排队"],
+    queued: ["pending", "排队中"],
+    waiting: ["idle", "待接单"],
   };
   const [cls, label] = map[status] || ["pending", status || "—"];
   return el("span", `pill ${cls}`, label);
@@ -143,7 +146,7 @@ function renderEmails() {
     deadline.append(out);
 
     const stagger = el("div", "field");
-    stagger.append(el("label", null, `错峰提交 · ${email.submit_after_ms}ms`));
+    stagger.append(el("label", null, `错峰接单（相对本批提交）· ${email.submit_after_ms}ms`));
     const staggerRange = el("input");
     staggerRange.type = "range";
     staggerRange.min = "0";
@@ -154,7 +157,8 @@ function renderEmails() {
     staggerRange.oninput = () => {
       email.submit_after_ms = Number(staggerRange.value);
       staggerOut.textContent = `${email.submit_after_ms}ms`;
-      stagger.querySelector("label").textContent = `错峰提交 · ${email.submit_after_ms}ms`;
+      stagger.querySelector("label").textContent =
+        `错峰接单（相对本批提交）· ${email.submit_after_ms}ms`;
     };
     stagger.append(staggerRange);
     stagger.append(staggerOut);
@@ -370,8 +374,9 @@ function buildJobCard(job) {
     for (const event of job.events) {
       const label =
         event.type === "model_switched"
-          ? `切换 ${event.from}→${event.to} @${event.at.slice(11, 19)}`
-          : `接单 #${event.index} → ${event.model_version} @${event.at.slice(11, 19)}`;
+          ? `切换 ${event.from}→${event.to} @${clockOf(event.at)}`
+          : `接单 #${event.index} → ${event.model_version} @${clockOf(event.at)}` +
+            (event.submit_after_ms ? `（错峰 ${event.submit_after_ms}ms）` : "");
       const cls = event.type === "model_switched" ? "event switch" : "event";
       const node = el("span", cls, label);
       if (event.pending_old !== undefined) {
@@ -390,6 +395,7 @@ function buildJobCard(job) {
     "正文",
     "截止",
     "状态",
+    "接单时间",
     "分数",
     "分类",
     "模型",
@@ -407,7 +413,7 @@ function buildJobCard(job) {
   if (!entries.length) {
     const tr = el("tr");
     const td = el("td", "empty", "结果加载中…");
-    td.colSpan = 10;
+    td.colSpan = 11;
     tr.append(td);
     tbody.append(tr);
   }
@@ -423,6 +429,7 @@ function buildJobCard(job) {
     const statusCell = el("td");
     statusCell.append(statusPill(entry.status));
     tr.append(statusCell);
+    tr.append(el("td", "mono small", clockOf(entry.accepted_at)));
     tr.append(el("td", "num", fmt(entry.score, 4)));
     const labelCell = el("td");
     if (entry.label) {
@@ -443,7 +450,7 @@ function buildJobCard(job) {
     if (entry.reason) notes.push(entry.reason);
     if (entry.late_result_discarded) notes.push("迟到结果已丢弃");
     if (entry.simulate_latency_ms) notes.push(`模拟延迟 ${entry.simulate_latency_ms}ms`);
-    if (entry.submit_after_ms) notes.push(`错峰 ${entry.submit_after_ms}ms`);
+    if (entry.submit_after_ms) notes.push(`错峰接单 ${entry.submit_after_ms}ms`);
     noteCell.textContent = notes.join(" · ") || "—";
     tr.append(noteCell);
     tbody.append(tr);

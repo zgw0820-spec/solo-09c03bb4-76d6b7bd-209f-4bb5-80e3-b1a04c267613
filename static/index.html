@@ -17,6 +17,7 @@
       <span><b>版本固定</b> 接单时快照</span>
       <span><b>批 ≤4</b> 等待 ≤200ms</span>
       <span><b>紧截止</b> 提前发批</span>
+      <span><b>错峰独立</b> 各自计时接单</span>
     </span>
   </header>
 
@@ -52,7 +53,8 @@
           <button class="primary" id="submit">提交审核</button>
         </div>
         <p class="small muted" id="submit-hint" style="margin:10px 0 0">
-          每封邮件独立指定 100～1000ms 截止时间。可选“错峰提交”与“模拟推理延迟”用于测试超时。
+          每封邮件独立指定 100～1000ms 截止时间，并按各自的「错峰提交」相对本批提交时刻独立计时接单：
+          输入顺序只决定结果编号，不会互相等待。截止时间从该邮件<b>实际接单</b>起算，接单时固定现行模型版本。
         </p>
       </div>
 

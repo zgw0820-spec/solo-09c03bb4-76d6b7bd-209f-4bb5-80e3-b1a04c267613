@@ -1,9 +1,13 @@
 """FastAPI gateway for the spam moderation review console.
 
-Intake pins the *current* active model version onto each accepted email, then
-hands it to the single in-process worker.  A model switch therefore affects
-only requests accepted from that moment on: emails already queued keep the
-version they were accepted with.
+Every email in a submission is scheduled **independently**: each entry waits
+out its own ``submit_after_ms`` (measured from the batch submission instant
+T0) and only then goes through intake, where the *current* active model
+version is pinned onto it and its per-item deadline clock starts.  Input
+order therefore only fixes result numbering — it never delays another
+email's acceptance.  A model switch affects exactly the emails accepted
+from that moment on; emails already accepted keep the version they were
+pinned with.
 """
 
 from __future__ import annotations
@@ -127,6 +131,14 @@ class JobEntry:
 
     def public(self) -> dict:
         result = self.result or {}
+        # Before intake the email is only waiting for its own stagger; once
+        # intake has run it is queued in (or already resolved by) the worker.
+        if result:
+            status = result.get("status", "accepted")
+        elif self.accepted_at is not None:
+            status = "queued"
+        else:
+            status = "waiting"
         return {
             "index": self.index,
             "text": self.text,
@@ -135,7 +147,7 @@ class JobEntry:
             "simulate_latency_ms": self.simulate_latency_ms,
             "model_version": self.model_version,
             "accepted_at": self.accepted_at,
-            "status": result.get("status", "accepted"),
+            "status": status,
             "score": result.get("score"),
             "label": result.get("label"),
             "threshold": result.get("threshold"),
@@ -160,6 +172,7 @@ class Job:
     finished_at: str | None = None
     error: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    event_seq: int = 0
 
     def public(self, *, include_entries: bool = True) -> dict:
         versions = sorted({e.model_version for e in self.entries if e.model_version})
@@ -171,7 +184,9 @@ class Job:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "error": self.error,
-            "events": list(self.events),
+            # Stable chronological order regardless of which scheduling task
+            # happened to append first.
+            "events": sorted(self.events, key=lambda ev: ev["seq"]),
             "size": len(self.entries),
             "settled": sum(1 for e in self.entries if e.result is not None),
             "ok": sum(1 for e in self.entries if (e.result or {}).get("status") == "ok"),
@@ -196,37 +211,60 @@ def _prune_jobs() -> None:
         jobs.pop(jid, None)
 
 
+def _append_event(job: Job, event: dict[str, Any]) -> None:
+    """Append an event with a job-wide monotonic sequence number."""
+    job.event_seq += 1
+    job.events.append({"seq": job.event_seq, **event})
+
+
+async def _run_entry(job: Job, entry: JobEntry, start: float) -> dict:
+    """Schedule and intake one email independently.
+
+    The stagger wait belongs to *this* entry only: it never blocks another
+    entry's task.  Intake (version pin + hand-off to the worker) happens at
+    T0 + ``submit_after_ms``, so the pinned model and the worker-side
+    deadline both reflect the actual acceptance instant.
+    """
+    delay = start + entry.submit_after_ms / 1000.0 - time.monotonic()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    # ---- intake: pin the version that is active right now ----
+    version = active_version
+    entry.model_version = version
+    entry.accepted_at = _now_iso()
+    _append_event(
+        job,
+        {
+            "at": entry.accepted_at,
+            "type": "accepted",
+            "index": entry.index,
+            "model_version": version,
+            "submit_after_ms": entry.submit_after_ms,
+        },
+    )
+    return await worker.submit(
+        text=entry.text,
+        model_version=version,
+        deadline_ms=entry.deadline_ms,
+        request_id=f"{job.id}-{entry.index}",
+        request_batch_id=job.id,
+        latency_sim_ms=entry.simulate_latency_ms,
+    )
+
+
 async def _run_job(job: Job) -> None:
     job.status = "running"
     job.started_at = _now_iso()
     start = time.monotonic()
-    tasks: list[asyncio.Task] = []
+    # Every entry gets its own scheduling task: each one waits out its own
+    # submit_after_ms relative to this batch's submission instant T0 and is
+    # accepted independently.  Input order only decides result numbering,
+    # because asyncio.gather preserves task order.
+    tasks = [
+        asyncio.create_task(_run_entry(job, entry, start))
+        for entry in job.entries
+    ]
     try:
-        for entry in job.entries:
-            delay = start + entry.submit_after_ms / 1000.0 - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            # ---- intake: pin the version that is active right now ----
-            version = active_version
-            entry.model_version = version
-            entry.accepted_at = _now_iso()
-            job.events.append(
-                {
-                    "at": entry.accepted_at,
-                    "type": "accepted",
-                    "index": entry.index,
-                    "model_version": version,
-                }
-            )
-            coro = worker.submit(
-                text=entry.text,
-                model_version=version,
-                deadline_ms=entry.deadline_ms,
-                request_id=f"{job.id}-{entry.index}",
-                request_batch_id=job.id,
-                latency_sim_ms=entry.simulate_latency_ms,
-            )
-            tasks.append(asyncio.create_task(coro))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for entry, result in zip(job.entries, results):
             if isinstance(result, BaseException):
@@ -442,76 +480,48 @@ async def demo_interleaved() -> dict:
     combined = SubmitIn(label="切换交错演示", emails=old_emails + new_emails)
     job = _new_job(combined, prefix="demo")
 
+    # New emails are accepted ~100 ms after T0 (same relative timing the old
+    # demo used), while the independent switch task flips the active model at
+    # ~60 ms.  Intake therefore observes v1 for the old emails and v2 for the
+    # new ones even though every entry schedules itself independently.
+    for offset, entry in zip((0, 0, 100, 100, 100, 100, 100), job.entries):
+        entry.submit_after_ms = offset
+
     async def orchestrate() -> None:
         job.status = "running"
         job.started_at = _now_iso()
         start = time.monotonic()
-        tasks: list[asyncio.Task] = []
-        try:
-            for entry in job.entries[: len(old_emails)]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
-                    )
-                )
+
+        async def switch_midway() -> None:
             await asyncio.sleep(max(0.0, start + 0.06 - time.monotonic()))
             event = _set_active(
                 "v2", source="demo", note="演示：切换到 v2（旧请求仍在排队）"
             )
-            job.events.append(
+            _append_event(
+                job,
                 {
                     "at": event["at"],
                     "type": "model_switched",
                     "from": event["from"],
                     "to": event["to"],
                     "pending_old": worker.pending_count("v1"),
-                }
+                },
             )
-            await asyncio.sleep(max(0.0, start + 0.10 - time.monotonic()))
-            for entry in job.entries[len(old_emails) :]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
-                    )
-                )
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for entry, result in zip(job.entries, results):
+
+        try:
+            # The switch task and every per-entry intake task run
+            # concurrently; no entry's stagger blocks another one.
+            results = await asyncio.gather(
+                switch_midway(),
+                *(_run_entry(job, entry, start) for entry in job.entries),
+                return_exceptions=True,
+            )
+            # The first gathered result belongs to switch_midway().
+            switch_result, entry_results = results[0], results[1:]
+            if isinstance(switch_result, BaseException):
+                logger.exception("demo %s model switch failed", job.id)
+                raise switch_result
+            for entry, result in zip(job.entries, entry_results):
                 if isinstance(result, BaseException):
                     entry.result = {
                         "status": "error",

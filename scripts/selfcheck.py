@@ -8,6 +8,10 @@ Verifies, over real HTTP:
 2. switching the active model
 3. version pinning: requests accepted before a switch keep the old version,
    requests accepted after it use the new one, and no batch mixes versions
+3b. staggered acceptance: each email waits out its own submit_after_ms
+   relative to the batch submission; input order never blocks intake
+3c. per-email deadlines: each deadline clock starts at that email's own
+   acceptance instant
 4. batching: 16 emails -> batches of at most 4
 5. deadlines: a slow email times out, its batch-mates still succeed, and the
    late result never flips the timeout back to success
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import sys
 import time
+from datetime import datetime
 
 import httpx
 
@@ -91,6 +96,77 @@ def main() -> int:
         if batch:
             expected = entry["model_version"]
             check(batch["model_version"] == expected, f"batch {batch['batch_id']} is pure {expected}")
+
+    print("3b. staggered acceptance is per-email and independent of input order")
+    client.post("/api/model", json={"version": "v1"})
+    reverse = client.post(
+        "/api/jobs",
+        json={
+            "label": "reverse-stagger",
+            "emails": [
+                {"text": SPAM, "deadline_ms": 1000, "submit_after_ms": 500},
+                {"text": SPAM, "deadline_ms": 1000, "submit_after_ms": 0},
+            ],
+        },
+    ).json()
+    reverse_state = wait_job(client, reverse["id"])
+    front, rear = reverse_state["entries"]
+    check(front["index"] == 1 and rear["index"] == 2, "result numbering still follows input order")
+    gap = (
+        datetime.fromisoformat(front["accepted_at"]) -
+        datetime.fromisoformat(rear["accepted_at"])
+    ).total_seconds()
+    check(0.40 <= gap <= 0.65, f"front email accepted ~500ms after the immediate rear one (gap={gap:.3f}s)")
+    check(all(e["status"] == "ok" for e in reverse_state["entries"]), "both staggered emails succeeded")
+    # Switching after both were accepted must not retarget either email.
+    client.post("/api/model", json={"version": "v2"})
+    reread = client.get(f"/api/jobs/{reverse['id']}").json()
+    check(all(e["model_version"] == "v1" for e in reread["entries"]), "accepted emails keep their pinned model after a later switch")
+
+    print("3c. each deadline starts at that email's own acceptance")
+    # The slow first email keeps the single worker busy until ~T0+525ms.  The
+    # second email is accepted at T0+500ms with its own 400ms deadline.  With
+    # independent intake it is enqueued immediately and served as soon as the
+    # worker frees up; a serial runner would have counted its deadline from T0
+    # and forced a pre-dispatch timeout.
+    own = client.post(
+        "/api/jobs",
+        json={
+            "label": "own-deadline",
+            "emails": [
+                {"text": SPAM, "deadline_ms": 900, "simulate_latency_ms": 300},
+                {"text": HAM, "deadline_ms": 400, "submit_after_ms": 500},
+            ],
+        },
+    ).json()
+    own_state = wait_job(client, own["id"])
+    blocker, delayed = own_state["entries"]
+    check(blocker["status"] == "ok", "blocking email finished")
+    check(delayed["status"] == "ok", "delayed email met the deadline measured from its own acceptance")
+    check(delayed["latency_ms"] < 400, f"latency {delayed['latency_ms']}ms counted from acceptance, not batch T0")
+    delay_gap = (
+        datetime.fromisoformat(delayed["accepted_at"]) -
+        datetime.fromisoformat(own_state["created_at"])
+    ).total_seconds()
+    check(0.40 <= delay_gap <= 0.65, f"delayed email accepted ~500ms after batch submission (gap={delay_gap:.3f}s)")
+
+    print("3d. timeout + late-result discard still work with staggered intake")
+    late = client.post(
+        "/api/classify",
+        json={
+            "label": "stagger-late",
+            "emails": [
+                {"text": SPAM, "deadline_ms": 150, "submit_after_ms": 300,
+                 "simulate_latency_ms": 500},
+                {"text": HAM, "deadline_ms": 1000, "submit_after_ms": 300},
+            ],
+        },
+    ).json()
+    slow, fast = late["entries"]
+    check(slow["status"] == "timeout", "staggered slow email timed out on its own deadline")
+    check(slow["late_result_discarded"] is True, "its late inference result was discarded")
+    check(fast["status"] == "ok", "its batch-mate still succeeded")
+    check(slow["batch_id"] == fast["batch_id"], "they shared one batch")
 
     print("4. batching limits (16 emails)")
     client.post("/api/model", json={"version": "v1"})
